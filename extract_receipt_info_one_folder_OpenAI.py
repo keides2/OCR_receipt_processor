@@ -7,14 +7,24 @@ import pandas as pd
 from io import BytesIO
 from PIL import Image, ImageFilter
 from google.cloud import vision
-
 import warnings
-# 全ての DeprecationWarning を無視
-warnings.simplefilter("ignore", DeprecationWarning)
 from pykakasi import kakasi
 import unicodedata
+import openai
+import os
 
-from rapidfuzz import fuzz
+# 全ての DeprecationWarning を無視
+warnings.simplefilter("ignore", DeprecationWarning)
+
+# OpenAI API設定
+api_key = os.environ.get("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY 環境変数が設定されていません")
+client = openai.OpenAI(
+    api_key=api_key,
+    base_url="https://api.openai.com/v1",  # 明示的にベースURLを指定
+    timeout=60.0  # タイムアウトを設定
+)
 
 # -----------------------------------------------------------------------------
 # 設定
@@ -23,8 +33,6 @@ vision_client = vision.ImageAnnotatorClient()
 RECEIPT_FOLDER = Path(r"G:\マイドライブ\receipt\receipt_img")
 CSV_FOLDER = Path(r"G:\マイドライブ\receipt\csv_statements")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
-FUZZ_THRESHOLD = 20
-FUZZ_METHODS = [fuzz.partial_ratio, fuzz.token_set_ratio, fuzz.token_sort_ratio]
 
 # キーは正規化＋大文字化した raw_store、値は正しいカタカナ
 BRAND_MAP = {
@@ -32,6 +40,8 @@ BRAND_MAP = {
     "KFC": "ケンタツキ-フライドチキン",
     "オンモールサカイテッポウマチ": "イオンモールサカイテッポウチヨウ",
     "コーナン": "コーナン商事",
+    "MINIサカイ": "アルコンサカイ",
+    "Toys us": "トイザらス",
 
     # 既存
     "ENEOS":           "エネオス",
@@ -61,6 +71,59 @@ BRAND_MAP = {
     "—FAMILYMART":     "ファミリーマート",
     "— FAMILYMART":    "ファミリーマート",
 }
+
+
+def get_similarity_score_with_chatgpt(ocr_kana, csv_kana):
+    """
+    ChatGPTを使用して文字列の類似度を計算します。
+
+    Args:
+        ocr_kana (str): OCRで抽出された店舗名
+        csv_kana (str): CSVに記載された店舗名
+
+    Returns:
+        float: 類似度スコア（0〜100）
+    """
+    prompt = (
+        f"以下の2つの日本語文字列の類似度を0から100のスコアで評価してください。\n"
+        f"1. {ocr_kana}\n"
+        f"2. {csv_kana}\n"
+        f"スコアのみを返してください。"
+    )
+
+    try:
+        # クォータ超過エラー時は文字列の単純比較にフォールバック
+        if ocr_kana == csv_kana:
+            return 100
+        elif normalize_spaces(ocr_kana) == normalize_spaces(csv_kana):
+            return 95
+        # 部分一致チェック
+        ocr_norm = normalize_spaces(ocr_kana)
+        csv_norm = normalize_spaces(csv_kana)
+        if ocr_norm in csv_norm or csv_norm in ocr_norm:
+            return 85
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "あなたは日本語の文字列比較を行うアシスタントです。"},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=10,
+            temperature=0
+        )
+        score = float(response.choices[0].message.content.strip())
+        return score
+    except Exception as e:
+        if "insufficient_quota" in str(e):
+            print("[WARNING] APIクォータ超過。文字列の単純比較にフォールバック")
+            # 文字列の長さに基づく簡易スコア計算
+            len_ratio = min(len(ocr_kana), len(csv_kana)) / max(len(ocr_kana), len(csv_kana))
+            return int(len_ratio * 70)  # 最大70点
+        else:
+            print(f"[ERROR] ChatGPT API呼び出し失敗: {e}")
+            return 0
+
 
 # kakasi の初期化（引き続き setMode を呼び出しますが警告は出ません）
 kks = kakasi()
@@ -108,11 +171,16 @@ def canonical_kana(s: str) -> str:
 
 def parse_date(s: str) -> datetime.date:
     s = (s or "").replace(" ", "")
-    for pat in [r"(\d{4})年(\d{1,2})月(\d{1,2})日",
-                r"(\d{4})[\/\-\.(](\d{1,2})[\/\-\.)](\d{1,2})"]:
+    for pat in [
+        r"(\d{4})年(\d{1,2})月(\d{1,2})日",  # 西暦形式
+        r"(\d{4})[\/\-\.(](\d{1,2})[\/\-\.)](\d{1,2})",  # 西暦スラッシュ形式
+        r"(\d{2})年(\d{1,2})月(\d{1,2})日"  # 元号形式（例: 25年01月18日）
+    ]:
         m = re.search(pat, s)
         if m:
             y, M, d = m.groups()
+            if len(y) == 2:  # 元号形式の場合
+                y = str(2000 + int(y))  # 2000年以降と仮定
             return datetime.date(int(y), int(M), int(d))
     return None
 
@@ -123,6 +191,41 @@ def preprocess_image(path: Path) -> bytes:
     buf = BytesIO(); bw.save(buf, format="PNG")
     return buf.getvalue()
 
+
+def normalize_store_name_with_gpt(raw_store: str) -> str:
+    """ChatGPTを使用して店舗名を正規化します"""
+    try:
+        prompt = (
+            f"以下の店舗名を正規化してカタカナで返してください。固有名詞は維持してください：\n"
+            f"{raw_store}\n"
+            f"カタカナのみを返してください。"
+        )
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "あなたは店舗名を正規化する日本語アシスタントです。"},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=30,
+            temperature=0
+        )
+        normalized = response.choices[0].message.content.strip()
+        print(f"[DEBUG] GPT正規化: {raw_store} → {normalized}")
+        return normalized
+    except Exception as e:
+        print(f"[WARNING] 店舗名正規化スキップ: {e}")
+        return raw_store
+
+
+def clean_store_name(raw_name: str) -> str:
+    """店舗名から不要な文字を除去して正規化"""
+    # カード売上などの不要な文字を除去
+    cleaned = re.sub(r'(カード)?売上.*$', '', raw_name)
+    # 記号除去
+    cleaned = re.sub(r'[【】\[\]()（）「」『』《》〈〉｛｝\{\}]', '', raw_name)
+    # 末尾の記号を除去
+    cleaned = re.sub(r'[】\]）>〉》\}｝]+$', '', cleaned)
+    return cleaned.strip()
 
 def extract_receipt_info(image_path: Path) -> dict:
     """
@@ -145,6 +248,19 @@ def extract_receipt_info(image_path: Path) -> dict:
     text  = resp.full_text_annotation.text
     lines = text.splitlines()
 
+    # デバッグ: OCR全文・行リスト出力
+    print("----- OCR全文 -----")
+    print(text)
+    print("----- OCR行リスト -----")
+    for i, ln in enumerate(lines):
+        print(f"[OCR line {i}]: {ln}")
+
+    # 「加盟店名」や「ミズラボ」でフィルタ
+    found_kameiten = any("加盟店名" in ln for ln in lines)
+    found_mizulabo = any("ミズラボ" in ln for ln in lines)
+    print(f"[DEBUG] 加盟店名含む行あり: {found_kameiten}")
+    print(f"[DEBUG] ミズラボ含む行あり: {found_mizulabo}")
+
     # --- 1) 日付抽出（デバッグ付き） ---
     date_obj = None
 
@@ -152,19 +268,24 @@ def extract_receipt_info(image_path: Path) -> dict:
     for idx, ln in enumerate(lines):
         if "ご利用日" in ln:
             print(f"[DEBUG] ご利用日ラベル行: line[{idx}]={ln!r}")
-            for j, nxt in enumerate(lines[idx+1:], start=idx+1):
+            # ラベル以降10行をスキャン
+            for j, nxt in enumerate(lines[idx+1:idx+11], start=idx+1):
                 print(f"[DEBUG]  ラベル後行 line[{j}]={nxt!r}")
-                m = re.match(r"([0-9]{2,4})[\/\-\.(](\d{1,2})[\/\-\.)](\d{1,2})", nxt)
+                # 年月日＋時刻も許容
+                m = re.match(r"([0-9]{2,4})年(\d{1,2})月(\d{1,2})日(?:\s*\d{1,2}:\d{2})?", nxt)
+                if not m:
+                    m = re.match(r"([0-9]{2,4})[\/\-\.(](\d{1,2})[\/\-\.)](\d{1,2})(?:\s*\d{1,2}:\d{2})?", nxt)
                 if not m:
                     continue
-                y_t, M_t, d_t = m.groups()
+                y_t, M_t, d_t = m.groups()[:3]
                 year  = int(y_t) if len(y_t)==4 else 2000 + int(y_t)
                 month = int(M_t); day = int(d_t)
                 print(f"[DEBUG]  ラベル後行マッチ groups={m.groups()} → {year}-{month}-{day}")
                 if 1 <= month <= 12 and 1 <= day <= 31:
                     date_obj = datetime.date(year, month, day)
+                    break
+            if date_obj:
                 break
-            # ラベル以降をスキャンし終えたらループ脱出
 
     # --- 1a-2) ご利用日パターン全文検索（行内に日付がまとまっている場合） ---
     if date_obj is None:
@@ -249,17 +370,50 @@ def extract_receipt_info(image_path: Path) -> dict:
             amount = max(int(n.replace(",", "")) for n in nums)
 
     # --- 3) 店舗名抽出 ---
-    m_store = re.search(r"加盟店名\s*([ァ-ヴー\dA-Za-z\-\—\s]+)", text)
-    if m_store:
-        raw_store = m_store.group(1).strip()
-    else:
-        raw_store = ""
-        for ln in lines:
-            if re.search(r"[一-龯ぁ-んァ-ヴーA-Za-z]", ln) and len(ln.strip()) > 1:
-                raw_store = ln.strip()
+    # 「加盟店名」行がある場合はその直後の行を優先
+    raw_store = ""
+    for idx, ln in enumerate(lines):
+        if "加盟店名" in ln:
+            # 「加盟店名」の直後の行が店舗名であることが多い
+            if idx + 1 < len(lines):
+                candidate = lines[idx + 1].strip()
+                # 5文字以上のカタカナ or カタカナ＋漢字混在 or 「ミズラボ」など特定ワード
+                if (re.fullmatch(r"[ァ-ヴー]{5,}", candidate)
+                    or (re.search(r"[一-龯]", candidate) and re.search(r"[ァ-ヴー]", candidate))
+                    or "ミズラボ" in candidate):
+                    raw_store = candidate
+                    print(f"[DEBUG] 加盟店名直後候補: {raw_store}")
+                    break
+            # 「加盟店名」行自体に店舗名が含まれる場合も考慮
+            m = re.search(r'加盟店名[：:\s]*([^\d\s]+)', ln)
+            if m:
+                raw_store = m.group(1).strip()
+                print(f"[DEBUG] 加盟店名行内候補: {raw_store}")
                 break
-        if not raw_store and lines:
+
+    # fallback: 既存の推定ロジック
+    if not raw_store:
+        candidates = []
+        for ln in lines:
+            if (re.search(r"[一-龯]", ln) and re.search(r"[ァ-ヴー]", ln)) or re.fullmatch(r"[ァ-ヴー]{5,}", ln):
+                candidates.append(ln)
+        if not candidates:
+            for ln in lines:
+                if re.fullmatch(r"[ァ-ヴー]+", ln):
+                    candidates.append(ln)
+        if not candidates:
+            for ln in lines:
+                if re.fullmatch(r"[A-Za-z\s]+", ln):
+                    candidates.append(ln)
+        if candidates:
+            raw_store = candidates[0].strip()
+        elif lines:
             raw_store = lines[0].strip()
+
+    print(f"[DEBUG] 店舗名候補: {raw_store}")
+
+    # クリーニング処理
+    raw_store = clean_store_name(raw_store)
 
     # --- 4) 店舗名マッピング ---
     eng = normalize_spaces(raw_store).upper()
@@ -267,9 +421,17 @@ def extract_receipt_info(image_path: Path) -> dict:
     if eng in BRAND_MAP:
         store_kana = BRAND_MAP[eng]
     else:
-        kana_tmp = canonical_kana(to_katakana(raw_store))
-        key      = normalize_spaces(kana_tmp).upper()
-        key      = re.sub(r'(?:-SS|/NFC)$', '', key)
+        try:
+            # GPTで正規化を試みる
+            normalized = normalize_store_name_with_gpt(raw_store)
+            kana_tmp = canonical_kana(normalized)
+        except Exception as e:
+            print(f"[WARNING] GPT正規化スキップ: {e}")
+            # フォールバック：通常のカタカナ変換
+            kana_tmp = canonical_kana(to_katakana(raw_store))
+
+        key = normalize_spaces(kana_tmp).upper()
+        key = re.sub(r'(?:-SS|/NFC)$', '', key)
         store_kana = BRAND_MAP.get(key, kana_tmp)
 
     return {
@@ -285,13 +447,6 @@ def mark_receipt_in_csv(csv_path: Path, info: dict, mismatches: list) -> bool:
     CSVを読み込み、OCR結果(info)の日付・金額と照合し、
     レシートチェック列を更新して上書き保存します。
 
-    • OCRで「リョウシュウ（領収書誤認）」と読まれた場合は自動一致を行わず、
-      正しいOCRを別途試行できるようスキップします。
-    • OCRで「ライフ」のように短い店名の場合は、
-      CSVの「ライフナカモズテン」等、接頭辞一致を優先してマッチさせます。
-    • それ以外は従来どおり英字→BRAND_MAP／カタカナ→BRAND_MAP→
-      部分文字列一致（RapidFuzz）でマッチングします。
-
     Args:
         csv_path (Path): CSVファイルパス
         info (dict): extract_receipt_info の戻り値
@@ -301,21 +456,11 @@ def mark_receipt_in_csv(csv_path: Path, info: dict, mismatches: list) -> bool:
         bool: 一致した行があれば True、なければ False
     """
     import pandas as pd
-    import re
-    from rapidfuzz import fuzz
 
     # OCR結果
     ocr_date = info["date_obj"]
     ocr_amt  = info["amount"]
     ocr_kana = info["store_kana"]
-
-    # 「リョウシュウ」など誤認識とみなすキーワード
-    MISREAD = {"リョウシュウ"}
-
-    # 誤認識ならスキップ
-    if ocr_kana in MISREAD:
-        print(f"[DEBUG] OCR店名が誤認識と判断、マッチングをスキップ: {ocr_kana}")
-        return False
 
     # CSV 読み込み
     try:
@@ -328,6 +473,11 @@ def mark_receipt_in_csv(csv_path: Path, info: dict, mismatches: list) -> bool:
     store_col  = next((c for c in df.columns if c in ["利用店名","利用店名・商品名","店舗名","加盟店名"]), None)
     amount_col = next((c for c in df.columns if c in ["利用金額","金額","取引金額"]), None)
 
+    # 必須列が見つからない場合はスキップ
+    if date_col is None or store_col is None or amount_col is None:
+        print(f"[WARNING] 必須列が見つかりません: date_col={date_col}, store_col={store_col}, amount_col={amount_col} in {csv_path.name}")
+        return False
+
     # チェック列追加
     if "レシートチェック" not in df.columns:
         df["レシートチェック"] = False
@@ -335,74 +485,38 @@ def mark_receipt_in_csv(csv_path: Path, info: dict, mismatches: list) -> bool:
     matched = False
     for idx, row in df.iterrows():
         # 日付・金額の照合（±5日以内を許容）
-        # 日付文字列をパース
         d_obj = parse_date(str(row[date_col]))
-        # 失敗時はスキップ
         if d_obj is None:
             continue
-        # 金額パース
         try:
             amt = float(str(row[amount_col]).replace(",", "") or 0)
         except:
             continue
 
-        # 日付のズレが5日以内かチェック
         delta_days = abs((d_obj - ocr_date).days)
         if delta_days > 5 or amt != ocr_amt:
-            # 5日以上ずれる or 金額不一致なら次の行へ
             continue
 
         # CSVの店舗名正規化
         raw_csv = str(row[store_col] or "")
-        # ① 英字BRAND_MAP優先
-        # (A) 英字正規化→BRAND_MAP（空白を残してキーを合わせる）
-        eng = normalize_text(raw_csv).upper()
-        eng = re.sub(r'(?:-SS|/NFC)$', '', eng)  # 接尾辞だけ削除
-        if eng in BRAND_MAP:
-            csv_kana = BRAND_MAP[eng]
-        else:
-            # ② 接頭辞一致（OCRが短い場合）
-            kana_tmp_csv = to_katakana(raw_csv)
-            kana_tmp_csv = canonical_kana(kana_tmp_csv)
-            key_csv = normalize_text(kana_tmp_csv).upper().replace(" ", "")
-            key_csv = re.sub(r'(?:-SS|/NFC)$', '', key_csv)
-            if kana_tmp_csv.startswith(ocr_kana) and len(ocr_kana) >= 3:
-                csv_kana = kana_tmp_csv
-            else:
-                # ③ カタカナ→BRAND_MAP
-                csv_kana = BRAND_MAP.get(key_csv, kana_tmp_csv)
+        csv_kana = BRAND_MAP.get(raw_csv.upper(), raw_csv)
 
-        # デバッグ出力
-        print(f"[DEBUG] 行{idx} → OCR:'{ocr_kana}', CSV:'{csv_kana}'")
+        # ChatGPTで類似度スコアを計算
+        score = get_similarity_score_with_chatgpt(ocr_kana, csv_kana)
+        print(f"[DEBUG] 行{idx} → OCR:'{ocr_kana}', CSV:'{csv_kana}', Score:{score}")
 
-        # 厳密一致 or 部分一致
-        if ocr_kana == csv_kana:
+        if score >= 30:  # スコアが30以上で一致とみなす
             df.at[idx, "レシートチェック"] = True
             matched = True
             break
         else:
-            # RapidFuzz で部分一致
-            scores = {
-                "partial_ratio": fuzz.partial_ratio(ocr_kana, csv_kana),
-                "token_sort":    fuzz.token_sort_ratio(ocr_kana, csv_kana),
-                "token_set":     fuzz.token_set_ratio(ocr_kana, csv_kana)
-            }
-            method = max(scores, key=scores.get)
-            score  = scores[method]
-            print(f"[DEBUG]    {method}={score:.1f}")
-            if score >= FUZZ_THRESHOLD:
-                df.at[idx, "レシートチェック"] = True
-                matched = True
-                break
-            else:
-                mismatches.append({
-                    "csv":       csv_path.name,
-                    "row":       idx,
-                    "ocr_store": ocr_kana,
-                    "csv_store": csv_kana,
-                    "method":    method,
-                    "score":     score
-                })
+            mismatches.append({
+                "csv":       csv_path.name,
+                "row":       idx,
+                "ocr_store": ocr_kana,
+                "csv_store": csv_kana,
+                "score":     score
+            })
 
     # 上書き保存
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
@@ -412,7 +526,7 @@ def mark_receipt_in_csv(csv_path: Path, info: dict, mismatches: list) -> bool:
 def main():
     """
     メイン処理:
-      1. レシート画像をOCR＆ファジーマッチング
+      1. レシート画像をOCR＆ChatGPTマッチング
       2. CSVを更新し、一致・不一致パターンをそれぞれファイルに保存
       3. 一致した画像は matched フォルダへ移動
     """
