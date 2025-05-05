@@ -1,3 +1,5 @@
+<img src="img/front_image.jpg" alt="Project Cover" width="100%">
+
 # OCR Receipt Processor
 
 このプロジェクトは、OCR（光学文字認識）を使用してレシート画像から情報を抽出し、CSVファイルと照合するPythonスクリプトです。Google Cloud Vision APIを利用してOCRを実行し、RapidFuzzを使用してファジーマッチングを行います。
